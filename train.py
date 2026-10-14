@@ -10,8 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
-import torch
-import torch.nn as nn
+import tensorflow as tf
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +25,7 @@ class TrainConfig:
     warmup_epochs E_w (e.g. 40), divergence_delta (e.g. 0.20),
     termination_penalty, beta (accuracy vs. NC reward weight), baseline
     hyperparameters, action ranges (lr, momentum, weight decay, batch sizes),
-    device, seed, output paths.
+    seed, output paths.
     """
 
 
@@ -57,35 +56,55 @@ def sample_random_action(config: TrainConfig, rng: np.random.Generator) -> Hyper
 
 
 # ---------------------------------------------------------------------------
-# Plain SGD training
+# Plain SGD training (custom loop with tf.GradientTape)
 # ---------------------------------------------------------------------------
 
-def build_optimizer(model: nn.Module, action: HyperparamAction) -> torch.optim.SGD:
-    """Create an SGD-with-momentum optimizer from the action's lr, momentum, and weight decay."""
+class SGDTrainer:
+    """Owns the model's SGD optimizer and a compiled train step.
+
+    Hyperparameters live in tf.Variables (lr, momentum, weight decay) so the
+    agent can change them between intervals without rebuilding the optimizer
+    (momentum buffers persist) or retracing the tf.function.
+    """
+
+    def __init__(self, model: tf.keras.Model, initial_action: HyperparamAction):
+        """Create the hyperparameter tf.Variables, a tf.keras.optimizers.SGD
+        reading lr/momentum from them, and the cross-entropy loss
+        (SparseCategoricalCrossentropy(from_logits=True))."""
+
+    def apply_action(self, action: HyperparamAction) -> None:
+        """Assign the action's lr, momentum, and weight decay to the tf.Variables."""
+
+    def set_learning_rate(self, lr: float) -> None:
+        """Assign a new value to the learning-rate variable (called every step by the interval schedule)."""
+
+    @tf.function
+    def train_step(self, x: tf.Tensor, y: tf.Tensor) -> tf.Tensor:
+        """One SGD step: forward pass under tf.GradientTape, cross-entropy plus
+        weight-decay penalty (lambda/2 * sum of squared weights), compute
+        gradients, apply them; return the batch loss."""
 
 
-def apply_action_to_optimizer(optimizer: torch.optim.SGD, action: HyperparamAction) -> None:
-    """Update lr, momentum, and weight decay in place in each param group.
+def lr_at_step(action: HyperparamAction, step: int, steps_in_interval: int) -> float:
+    """Return the learning rate at a given step of an interval under the action's
+    schedule shape (constant, cosine decay, or linear decay from action.lr)."""
 
-    Done in place (rather than rebuilding the optimizer) so momentum buffers
-    persist across decision intervals.
+
+def train_one_epoch(trainer: SGDTrainer, dataset: tf.data.Dataset, action: HyperparamAction,
+                    step_offset: int, steps_in_interval: int) -> tuple[float, int]:
+    """Run one epoch, setting the per-step LR via lr_at_step before each train_step.
+
+    Return (mean training loss, updated step offset within the interval).
     """
 
 
-def build_interval_scheduler(optimizer: torch.optim.SGD, action: HyperparamAction, steps_in_interval: int):
-    """Return a per-step LR scheduler implementing the action's schedule shape over one K-epoch interval."""
-
-
-def train_one_epoch(model: nn.Module, loader, optimizer, scheduler, device) -> float:
-    """Run one epoch of cross-entropy SGD, stepping the scheduler each batch; return mean training loss."""
-
-
-def train_interval(model, dataset, optimizer, action: HyperparamAction, config: TrainConfig, rng) -> float:
+def train_interval(trainer: SGDTrainer, X: np.ndarray, y: np.ndarray, action: HyperparamAction,
+                   config: TrainConfig, seed: int) -> float:
     """Train for K epochs under one action.
 
-    Rebuild the DataLoader for the action's batch size, apply the action to the
-    optimizer, build the interval scheduler, and call train_one_epoch K times.
-    Return the last epoch's loss.
+    Rebuild the tf.data pipeline for the action's batch size, apply the action
+    to the trainer, and call train_one_epoch K times. Return the last epoch's
+    loss.
     """
 
 
@@ -128,13 +147,15 @@ class NCTrainingEnv:
     returns (state, reward, done, info).
     """
 
-    def __init__(self, config: TrainConfig, mode: AgentMode, dataset, standardizer, baseline_acc_curve: np.ndarray):
-        """Store the config, objective mode, dataset, frozen NCStandardizer, and baseline accuracy-per-epoch curve."""
+    def __init__(self, config: TrainConfig, mode: AgentMode, X: np.ndarray, y: np.ndarray,
+                 standardizer, baseline_acc_curve: np.ndarray):
+        """Store the config, objective mode, training data, frozen NCStandardizer,
+        and baseline accuracy-per-epoch curve."""
 
     def reset(self, seed: int | None = None) -> np.ndarray:
         """Start a new episode from freshly initialized weights.
 
-        Build the model and optimizer, evaluate the initial checkpoint, reset
+        Build the model and SGDTrainer, evaluate the initial checkpoint, reset
         the epoch counter and previous metrics, and return the initial state.
         """
 
@@ -167,25 +188,31 @@ class NCTrainingEnv:
 # RL agent
 # ---------------------------------------------------------------------------
 
-class ActorCritic(nn.Module):
+class ActorCritic(tf.keras.Model):
     """Policy and value network for a mixed action space.
 
-    Shared trunk over the state; Gaussian heads for the continuous actions
-    (lr, momentum, weight decay), categorical heads for the discrete actions
-    (schedule shape, batch size), and a scalar value head.
+    Shared trunk over the state; Gaussian heads (mean + learned log-std) for
+    the continuous actions (lr, momentum, weight decay), categorical logit
+    heads for the discrete actions (schedule shape, batch size), and a scalar
+    value head.
     """
 
     def __init__(self, state_dim: int, config: TrainConfig):
-        """Build the trunk, action heads, and value head."""
+        """Build the trunk, action heads, and value head as Dense layers."""
 
-    def forward(self, state: torch.Tensor):
-        """Return the action distributions and the state value."""
+    def call(self, state: tf.Tensor):
+        """Return the action-distribution parameters (Gaussian means/log-stds,
+        categorical logits) and the state value."""
 
-    def act(self, state: torch.Tensor, deterministic: bool = False):
+    def act(self, state: tf.Tensor, deterministic: bool = False):
         """Sample (or take the mode of) an action; return action, log-prob, value."""
 
-    def evaluate_actions(self, states: torch.Tensor, actions):
-        """Return log-probs, entropies, and values for a batch of stored actions (for the PPO update)."""
+    def evaluate_actions(self, states: tf.Tensor, actions):
+        """Return log-probs, entropies, and values for a batch of stored actions (for the PPO update).
+
+        Log-probs and entropies can be written by hand for Gaussian and
+        categorical heads, or via tensorflow_probability.distributions.
+        """
 
 
 class RolloutBuffer:
@@ -208,19 +235,21 @@ class PPOAgent:
     """PPO learner that wraps an ActorCritic."""
 
     def __init__(self, state_dim: int, config: TrainConfig):
-        """Build the ActorCritic, optimizer, and PPO hyperparameters (clip, epochs, minibatch size, entropy coef)."""
+        """Build the ActorCritic, a tf.keras.optimizers.Adam, and PPO hyperparameters
+        (clip, epochs, minibatch size, entropy coef, value coef)."""
 
     def select_action(self, state: np.ndarray, deterministic: bool = False):
         """Return (raw_action, log_prob, value) for an environment state."""
 
     def update(self, buffer: RolloutBuffer) -> dict:
-        """Run clipped-objective PPO updates on the buffer; return loss statistics for logging."""
+        """Run clipped-objective PPO updates on the buffer with tf.GradientTape;
+        return loss statistics for logging."""
 
     def save(self, path: str) -> None:
-        """Save the policy weights."""
+        """Save the policy weights (model.save_weights)."""
 
     def load(self, path: str) -> None:
-        """Load policy weights."""
+        """Load policy weights (model.load_weights)."""
 
 
 def train_agent(env: NCTrainingEnv, agent: PPOAgent, n_episodes: int, config: TrainConfig) -> list[dict]:

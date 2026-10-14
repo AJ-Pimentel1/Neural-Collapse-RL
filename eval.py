@@ -7,8 +7,7 @@ every K epochs, from a full pass over the penultimate-layer features.
 from dataclasses import dataclass
 
 import numpy as np
-import torch
-from torch.utils.data import DataLoader
+import tensorflow as tf
 
 
 @dataclass
@@ -20,21 +19,21 @@ class ClassStatistics:
     """
 
 
-@torch.no_grad()
-def collect_features(model, loader: DataLoader, device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the model over the full loader in eval mode.
+def collect_features(model, dataset: tf.data.Dataset) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    """Run the model over the full eval dataset with training=False.
 
     Return (features, labels, logits): penultimate-layer activations,
-    integer labels, and classifier outputs for every training sample.
+    integer labels, and classifier outputs for every training sample,
+    concatenated across batches.
     """
 
 
-def compute_class_statistics(features: torch.Tensor, labels: torch.Tensor, num_classes: int) -> ClassStatistics:
+def compute_class_statistics(features: tf.Tensor, labels: tf.Tensor, num_classes: int) -> ClassStatistics:
     """Compute the global mean, class means, Sigma_W, and Sigma_B from the features."""
 
 
 def compute_nc1(stats: ClassStatistics, num_classes: int) -> float:
-    """Variability collapse: Tr(Sigma_W Sigma_B^dagger) / C, using the pseudo-inverse of Sigma_B."""
+    """Variability collapse: Tr(Sigma_W Sigma_B^dagger) / C, using tf.linalg.pinv for Sigma_B^dagger."""
 
 
 def compute_nc2(stats: ClassStatistics) -> float:
@@ -46,15 +45,16 @@ def compute_nc2(stats: ClassStatistics) -> float:
     """
 
 
-def compute_nc3(stats: ClassStatistics, classifier_weight: torch.Tensor) -> float:
+def compute_nc3(stats: ClassStatistics, classifier_weight: tf.Tensor) -> float:
     """Convergence to self-duality.
 
-    Return the misalignment between the normalized classifier weights W and the
-    normalized centered class means, e.g. || W/||W||_F - M/||M||_F ||_F.
+    Return the misalignment between the normalized classifier weights W
+    (shape (C, d)) and the normalized centered class means, e.g.
+    || W/||W||_F - M/||M||_F ||_F.
     """
 
 
-def compute_nc4(features: torch.Tensor, logits: torch.Tensor, stats: ClassStatistics) -> float:
+def compute_nc4(features: tf.Tensor, logits: tf.Tensor, stats: ClassStatistics) -> float:
     """Simplification to nearest class center.
 
     Return the fraction of training samples where the classifier's argmax
@@ -62,19 +62,20 @@ def compute_nc4(features: torch.Tensor, logits: torch.Tensor, stats: ClassStatis
     """
 
 
-def compute_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
-    """Return training accuracy in [0, 1]."""
+def compute_loss_and_accuracy(logits: tf.Tensor, labels: tf.Tensor) -> tuple[float, float]:
+    """Return (mean cross-entropy loss, training accuracy in [0, 1])."""
 
 
-def compute_norms(features: torch.Tensor, classifier_weight: torch.Tensor) -> tuple[float, float]:
+def compute_norms(features: tf.Tensor, classifier_weight: tf.Tensor) -> tuple[float, float]:
     """Return (mean feature norm ||f||, classifier weight norm ||W||) for the state vector."""
 
 
-def evaluate_checkpoint(model, loader: DataLoader, num_classes: int, device) -> dict:
+def evaluate_checkpoint(model, dataset: tf.data.Dataset, num_classes: int) -> dict:
     """Compute every quantity for one checkpoint.
 
-    Return a dict with keys: loss, acc, nc1, nc2, nc3, nc4, feature_norm,
-    weight_norm. This is what the environment logs and turns into a state.
+    Return a dict of Python floats with keys: loss, acc, nc1, nc2, nc3, nc4,
+    feature_norm, weight_norm. This is what the environment logs and turns
+    into a state.
     """
 
 

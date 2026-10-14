@@ -8,8 +8,7 @@ dependencies:
   - numpy
   - scipy
   - pip:
-    - torch
-    - torchvision
+    - tensorflow
     - foolbox
     - matplotlib
     - tqdm
