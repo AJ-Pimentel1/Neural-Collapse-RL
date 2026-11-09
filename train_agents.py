@@ -1,9 +1,10 @@
-"""Training loops, the training-as-MDP environment, and RL agent training.
+"""Training-as-MDP environment, PPO agents, policy extraction, and the search comparison.
 
 Fixed across all runs: architecture, optimizer family (SGD with momentum),
 cross-entropy loss, balanced data with uniform sampling, total epoch budget.
 Controlled by the agents: learning rate + schedule shape, momentum, batch
-size, weight decay.
+size, weight decay. SGD training itself lives in sgd_trainer.py; the frozen
+baseline curves come from train_baseline.py.
 """
 
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ from enum import Enum
 
 import numpy as np
 import tensorflow as tf
+
+from sgd_trainer import HyperparamAction
 
 
 # ---------------------------------------------------------------------------
@@ -21,33 +24,19 @@ import tensorflow as tf
 class TrainConfig:
     """Experiment-wide settings.
 
-    Fields to define: total_epochs, K (epochs per decision interval),
-    warmup_epochs E_w (e.g. 40), divergence_delta (e.g. 0.20),
-    termination_penalty, beta (accuracy vs. NC reward weight), baseline
-    hyperparameters, action ranges (lr, momentum, weight decay, batch sizes),
-    seed, output paths.
-    """
-
-
-class ScheduleShape(Enum):
-    """Within-interval learning-rate schedule shapes: CONSTANT, COSINE, LINEAR."""
-
-
-@dataclass
-class HyperparamAction:
-    """One agent action, applied for the next K epochs.
-
-    Fields to define: lr (eta_t), schedule (sigma_t), momentum (rho_t),
-    batch_size (B_t), weight_decay (lambda_t).
+    Fields to define: total_epochs T, K (epochs per decision interval; H = T/K),
+    warmup_epochs E_w, divergence_delta (0.20), termination_penalty, action
+    ranges (lr [1e-3, 1] log scale, momentum [0, 0.99], weight decay
+    [1e-6, 1e-2] log scale, batch sizes {32, ..., 512}), seed, output paths.
     """
 
 
 def decode_action(raw_action, config: TrainConfig) -> HyperparamAction:
     """Map the policy's raw output to a HyperparamAction.
 
-    Continuous parts (lr, momentum, weight decay) are squashed/clipped into
-    their ranges; discrete parts (schedule shape, batch size) are indexed from
-    their option lists.
+    Continuous parts are squashed into their ranges (log scale for lr and
+    weight decay); discrete parts (schedule shape: "constant", "cosine",
+    "linear"; batch size) are indexed from their option lists.
     """
 
 
@@ -56,77 +45,13 @@ def sample_random_action(config: TrainConfig, rng: np.random.Generator) -> Hyper
 
 
 # ---------------------------------------------------------------------------
-# Plain SGD training (custom loop with tf.GradientTape)
+# Reference pool
 # ---------------------------------------------------------------------------
 
-class SGDTrainer:
-    """Owns the model's SGD optimizer and a compiled train step.
-
-    Hyperparameters live in tf.Variables (lr, momentum, weight decay) so the
-    agent can change them between intervals without rebuilding the optimizer
-    (momentum buffers persist) or retracing the tf.function.
-    """
-
-    def __init__(self, model: tf.keras.Model, initial_action: HyperparamAction):
-        """Create the hyperparameter tf.Variables, a tf.keras.optimizers.SGD
-        reading lr/momentum from them, and the cross-entropy loss
-        (SparseCategoricalCrossentropy(from_logits=True))."""
-
-    def apply_action(self, action: HyperparamAction) -> None:
-        """Assign the action's lr, momentum, and weight decay to the tf.Variables."""
-
-    def set_learning_rate(self, lr: float) -> None:
-        """Assign a new value to the learning-rate variable (called every step by the interval schedule)."""
-
-    @tf.function
-    def train_step(self, x: tf.Tensor, y: tf.Tensor) -> tf.Tensor:
-        """One SGD step: forward pass under tf.GradientTape, cross-entropy plus
-        weight-decay penalty (lambda/2 * sum of squared weights), compute
-        gradients, apply them; return the batch loss."""
-
-
-def lr_at_step(action: HyperparamAction, step: int, steps_in_interval: int) -> float:
-    """Return the learning rate at a given step of an interval under the action's
-    schedule shape (constant, cosine decay, or linear decay from action.lr)."""
-
-
-def train_one_epoch(trainer: SGDTrainer, dataset: tf.data.Dataset, action: HyperparamAction,
-                    step_offset: int, steps_in_interval: int) -> tuple[float, int]:
-    """Run one epoch, setting the per-step LR via lr_at_step before each train_step.
-
-    Return (mean training loss, updated step offset within the interval).
-    """
-
-
-def train_interval(trainer: SGDTrainer, X: np.ndarray, y: np.ndarray, action: HyperparamAction,
-                   config: TrainConfig, seed: int) -> float:
-    """Train for K epochs under one action.
-
-    Rebuild the tf.data pipeline for the action's batch size, apply the action
-    to the trainer, and call train_one_epoch K times. Return the last epoch's
-    loss.
-    """
-
-
-def run_fixed_schedule(schedule: list[HyperparamAction], config: TrainConfig, seed: int) -> list[dict]:
-    """Train a fresh model with a fixed, non-adaptive sequence of actions (one per interval).
-
-    Evaluate NC metrics and accuracy every K epochs and return the list of
-    checkpoint dicts. Used for the baseline, the reference pool, and policy
-    extraction replay.
-    """
-
-
-def run_baseline(config: TrainConfig, seed: int) -> list[dict]:
-    """Run standard SGD with the fixed baseline hyperparameters for the full budget.
-
-    Returns the checkpoint trajectory; its training-accuracy curve is the
-    reference for the divergence-based termination rule.
-    """
-
-
 def collect_reference_pool(config: TrainConfig, n_runs: int, seed: int) -> list[dict]:
-    """Collect checkpoints from the baseline plus n_runs runs with random action schedules.
+    """Run n_runs episodes with uniformly random actions (sample_random_action per
+    interval) via sgd_trainer.run_fixed_schedule, and pool their checkpoints with
+    the baseline seeds' checkpoints (results/baseline/seed*.csv).
 
     The pooled records are used to fit the NCStandardizer.
     """
@@ -147,38 +72,39 @@ class NCTrainingEnv:
     returns (state, reward, done, info).
     """
 
-    def __init__(self, config: TrainConfig, mode: AgentMode, X: np.ndarray, y: np.ndarray,
-                 standardizer, baseline_acc_curve: np.ndarray):
-        """Store the config, objective mode, training data, frozen NCStandardizer,
-        and baseline accuracy-per-epoch curve."""
+    def __init__(self, config: TrainConfig, mode: AgentMode, standardizer, baseline_mean_csv: str):
+        """Store the config, objective mode, frozen NCStandardizer, and the frozen
+        seed-averaged baseline curves Acc^SGD_t and D^SGD_t (from baseline_mean.csv)."""
 
     def reset(self, seed: int | None = None) -> np.ndarray:
         """Start a new episode from freshly initialized weights.
 
-        Build the model and SGDTrainer, evaluate the initial checkpoint, reset
-        the epoch counter and previous metrics, and return the initial state.
+        Build the model and sgd_trainer.SGDTrainer, evaluate the initial
+        checkpoint, reset the epoch counter, and return the initial state.
         """
 
     def step(self, raw_action) -> tuple[np.ndarray, float, bool, dict]:
-        """Decode the action, train for K epochs, evaluate, compute reward, and check termination.
+        """Decode the action, train K epochs with SGDTrainer.train_epoch (passing the
+        position within the interval so the schedule shape spans all K epochs),
+        evaluate, compute reward, and check termination.
 
         info should include the raw metrics, D_NC, and the decoded action for
         logging and policy extraction.
         """
 
-    def _build_state(self, metrics: dict, prev_action: HyperparamAction) -> np.ndarray:
-        """Assemble s_t = [loss, acc, standardized NC1-NC4, ||f||, ||W||, previous eta, rho, B, lambda]."""
+    def _build_state(self, metrics: dict, prev_action: HyperparamAction, t: int) -> np.ndarray:
+        """Assemble s_t = (Acc_t, standardized NC1-NC4, ||h_t||, ||W_t||, a_{t-1}, t/H)."""
 
-    def _compute_reward(self, metrics: dict, prev_metrics: dict) -> float:
-        """Return beta * dAcc + (1 - beta) * (-/+ dD_NC).
+    def _compute_reward(self, metrics: dict, epoch: int) -> float:
+        """Return 1/2 (Acc - Acc^SGD) + 1/2 s (D^SGD - D) at this epoch.
 
-        The sign on dD_NC is negative for EXPRESSION (reward decreasing D_NC)
-        and positive for SUPPRESSION (reward increasing D_NC).
+        s = +1 for EXPRESSION, -1 for SUPPRESSION. A policy that copies SGD
+        earns zero return in expectation. Returns are undiscounted.
         """
 
-    def _check_divergence(self, metrics: dict) -> bool:
+    def _check_divergence(self, metrics: dict, epoch: int) -> bool:
         """Return True if, after warmup_epochs, training accuracy is more than
-        divergence_delta below the baseline's accuracy at the same epoch."""
+        divergence_delta (20 points) below Acc^SGD at the same epoch."""
 
     def _is_episode_over(self) -> bool:
         """Return True once the total epoch budget has been used."""
@@ -274,9 +200,19 @@ def replay_and_compare(schedule: list[HyperparamAction], config: TrainConfig, se
     summarize final accuracy and NC metrics versus the baseline."""
 
 
+# ---------------------------------------------------------------------------
+# Learned schedules versus hyperparameter search
+# ---------------------------------------------------------------------------
+
+def run_constant_search(n_runs: int, mode: AgentMode, config: TrainConfig, seeds: list[int]) -> dict:
+    """Random search over constant settings held for the whole run, given the same
+    number of training runs the RL agent consumed. Select the setting with the
+    highest mean return across seeds and record best-so-far vs. runs consumed."""
+
+
 def main():
-    """Parse arguments and run: baseline -> reference pool / standardizer fit ->
-    train expression and suppression agents -> policy extraction and ablations."""
+    """Parse arguments and run: reference pool / standardizer fit -> train expression
+    and suppression agents -> policy extraction, ablations, and the search comparison."""
 
 
 if __name__ == "__main__":

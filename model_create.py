@@ -13,10 +13,16 @@ import tensorflow as tf
 class MLPConfig:
     """Architecture parameters (fixed for the whole project).
 
-    Fields to define: input_dim, hidden_width, depth (number of hidden layers,
-    2-3), num_classes, activation (e.g. "relu"), use_bias for the classifier,
-    kernel_initializer (e.g. "he_normal").
+    3 x 256 gives ~140k parameters, far more than N = 5,000, so interpolation
+    is possible, and a penultimate width far above C - 1 = 9 so an ETF fits.
     """
+    input_dim: int = 20
+    hidden_width: int = 256
+    depth: int = 3
+    num_classes: int = 10
+    activation: str = "relu"
+    use_bias: bool = True
+    kernel_initializer: str = "he_normal"
 
 
 class NCMLP(tf.keras.Model):
@@ -27,34 +33,50 @@ class NCMLP(tf.keras.Model):
     """
 
     def __init__(self, config: MLPConfig):
-        """Build the feature extractor (depth x Dense with activation) and the final linear Dense classifier (no activation)."""
+        super().__init__()
+        self.mlp_config = config
+        self.feature_extractor = tf.keras.Sequential([
+            tf.keras.layers.Dense(config.hidden_width, activation=config.activation,
+                                  kernel_initializer=config.kernel_initializer)
+            for _ in range(config.depth)
+        ])
+        self.classifier = tf.keras.layers.Dense(config.num_classes, use_bias=config.use_bias,
+                                                kernel_initializer=config.kernel_initializer)
 
-    def extract_features(self, x: tf.Tensor, training: bool = False) -> tf.Tensor:
+    def extract_features(self, x, training=False):
         """Return the penultimate-layer activations h(x), shape (batch, hidden_width)."""
+        return self.feature_extractor(x, training=training)
 
-    def call(self, x: tf.Tensor, training: bool = False) -> tf.Tensor:
+    def call(self, x, training=False):
         """Return the logits W h(x) + b, shape (batch, num_classes)."""
+        return self.classifier(self.extract_features(x, training=training))
 
     @property
-    def classifier_weight(self) -> tf.Tensor:
-        """Return the classifier weight matrix W, shape (num_classes, hidden_width).
+    def classifier_weight(self):
+        """Classifier weight matrix W with rows w_c, shape (num_classes, hidden_width).
 
         Keras stores the Dense kernel as (hidden_width, num_classes), so this
         returns its transpose.
         """
+        return tf.transpose(self.classifier.kernel)
 
     @property
-    def classifier_bias(self) -> tf.Tensor | None:
-        """Return the classifier bias b, or None if the classifier has no bias."""
+    def classifier_bias(self):
+        """Classifier bias b, or None if the classifier has no bias."""
+        return self.classifier.bias if self.mlp_config.use_bias else None
 
 
 def build_model(config: MLPConfig, seed: int) -> NCMLP:
-    """Seed TF/NumPy/Python (tf.keras.utils.set_random_seed), construct an NCMLP,
-    and build its weights by calling it on a dummy batch of shape (1, input_dim).
+    """Seed Python/NumPy/TF, construct an NCMLP, and build its weights on a dummy batch.
 
-    Each RL episode calls this to start from fresh random weights.
+    Each run (and each RL episode) calls this to start from fresh random weights.
     """
+    tf.keras.utils.set_random_seed(seed)
+    model = NCMLP(config)
+    model(tf.zeros((1, config.input_dim)))
+    return model
 
 
 def count_parameters(model: tf.keras.Model) -> int:
     """Return the number of trainable parameters."""
+    return int(sum(tf.size(v) for v in model.trainable_variables))
